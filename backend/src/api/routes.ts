@@ -1,9 +1,14 @@
 /**
- * API routing, as a pure function of (method, path, query) -> (status, body).
+ * API routing, as a function of (method, path, query) -> (status, body).
  *
  * Deliberately free of `node:http`: the routing table, the parameter coercion
  * and the 404/400 decisions are the parts worth testing, and none of them need
  * a socket. `server.ts` is the only file that knows about requests.
+ *
+ * Every route but one is synchronous, because every route but one reads a
+ * synchronous SQLite connection. The AI Assist route calls a model, so `route`
+ * returns `ApiResponse | Promise<ApiResponse>` rather than making the other six
+ * routes pretend to be asynchronous.
  */
 import type { Db } from '../store/db.js';
 import type { TimelineResourceType } from '../query/dto.js';
@@ -12,6 +17,7 @@ import { getStoreMeta } from '../query/meta.js';
 import { searchPatients } from '../query/patients.js';
 import { getResource, getTimeline, TIMELINE_TYPES } from '../query/timeline.js';
 import { assessCohort, assessPatient } from '../eligibility/index.js';
+import { assistPatient } from '../assist/index.js';
 
 export interface ApiResponse {
   status: number;
@@ -92,12 +98,30 @@ export function route(
   pathname: string,
   params: URLSearchParams,
   now: Date = new Date(),
-): ApiResponse {
-  if (method !== 'GET') return fail(405, 'method-not-allowed', `${method} is not supported`);
-
+): ApiResponse | Promise<ApiResponse> {
   // Split once; every route below is a match on this segment list.
   const segments = pathname.split('/').filter(Boolean);
   if (segments[0] !== 'api') return fail(404, 'not-found', pathname);
+
+  // POST /api/patients/:id/assist?asOf=
+  //
+  // The only write-shaped route in the API, and it writes nothing. POST because
+  // it spends money on a model call: GET would license a browser, a proxy or a
+  // prefetching link to make that call on its own.
+  if (segments.length === 4 && segments[1] === 'patients' && segments[3] === 'assist') {
+    if (method !== 'POST') {
+      return fail(405, 'method-not-allowed', `${method} is not supported here; use POST`);
+    }
+    const patientId = decodeURIComponent(segments[2] as string);
+    const asOf = asOfParam(params);
+    if (!asOf.ok) return fail(400, 'bad-request', asOf.message);
+
+    return assistPatient(db, patientId, { requested: asOf.value, now }).then((result) =>
+      result ? { status: 200, body: result } : fail(404, 'patient-not-found', patientId),
+    );
+  }
+
+  if (method !== 'GET') return fail(405, 'method-not-allowed', `${method} is not supported`);
 
   // GET /api/meta
   if (segments.length === 2 && segments[1] === 'meta') {

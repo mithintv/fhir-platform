@@ -83,12 +83,12 @@ function serveStatic(staticDir: string, urlPath: string, response: ServerRespons
  * message is included because this is a local review tool run against a local
  * store, not an internet-facing service where it would leak internals.
  */
-function handleRequest(
+async function handleRequest(
   db: Db,
   options: ServerOptions,
   request: IncomingMessage,
   response: ServerResponse,
-): void {
+): Promise<void> {
   const url = new URL(request.url ?? '/', 'http://localhost');
 
   if (options.devOrigin) {
@@ -109,7 +109,9 @@ function handleRequest(
   }
 
   try {
-    const result = route(db, request.method ?? 'GET', url.pathname, url.searchParams);
+    // Six of the seven routes return synchronously; the AI Assist route returns
+    // a promise. Awaiting unconditionally keeps this one branch instead of two.
+    const result = await route(db, request.method ?? 'GET', url.pathname, url.searchParams);
     sendJson(response, result.status, result.body);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -152,9 +154,11 @@ export function startServer(options: ServerOptions): Promise<{ server: Server; d
 
   checkpointIfNeeded(options.dbPath);
   const db = openDatabase(options.dbPath, { readOnly: true });
-  const server = createServer((request, response) =>
-    handleRequest(db, options, request, response),
-  );
+  // `handleRequest` catches everything it awaits, so the returned promise never
+  // rejects; `void` says that is deliberate rather than forgotten.
+  const server = createServer((request, response) => {
+    void handleRequest(db, options, request, response);
+  });
 
   return new Promise((resolveStarted, rejectStarted) => {
     server.once('error', rejectStarted);

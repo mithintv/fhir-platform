@@ -7,10 +7,11 @@
   "engines": {
     "node": ">=20"
   },
-  "//exports": "Only the wire types are exported. Both entries are type declarations whose only imports are `import type` of each other, so nothing reachable from here can pull node:sqlite into a browser bundle. Server code is imported by path within this package.",
+  "//exports": "Only the wire types are exported. All three entries are type declarations whose only imports are `import type` of each other, so nothing reachable from here can pull node:sqlite — or the Anthropic SDK — into a browser bundle. Server code is imported by path within this package.",
   "exports": {
     "./dto": "./src/query/dto.ts",
-    "./eligibility-dto": "./src/eligibility/dto.ts"
+    "./eligibility-dto": "./src/eligibility/dto.ts",
+    "./assist-dto": "./src/assist/dto.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -27,5 +28,8 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0"
   }
 }

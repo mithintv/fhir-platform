@@ -700,6 +700,71 @@ body {
   font-size: 12px;
 }
 
+
+/* ------------------------------------------------------------ ai assist -- */
+
+/*
+ * Model-authored text is always marked, and never styled like a finding.
+ *
+ * The tag is the whole device: a reviewer scanning the drawer has to be able to
+ * tell in one glance which sentences the policy engine produced and which a
+ * model did. Colour is not used for the distinction — colour in this UI means
+ * data quality — so the separation is a label plus a rule.
+ */
+.assist-note {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--line);
+}
+
+.assist-note__tag {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 3px;
+  margin-right: 4px;
+}
+
+/* One summary sentence per row, its citations beneath it. */
+.claim-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.claim {
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  background: var(--surface-sunken);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 3px 3px 0;
+}
+
+/* A claim about a gap is dashed, exactly as weak evidence is. */
+.claim--gap {
+  border-left-style: dashed;
+  border-left-color: var(--gap-line);
+}
+
+.claim__text {
+  font-size: 13px;
+  max-width: 78ch;
+}
+
+.claim__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
 .masthead__views {
   display: flex;
   gap: 6px;

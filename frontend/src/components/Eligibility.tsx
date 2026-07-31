@@ -18,15 +18,17 @@
  * in the checklist.
  */
 import type { ReactNode } from 'react';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
+  AssistResult,
   Determination,
   EligibilityAssessment,
   EvidenceItem,
   RequirementFinding,
   RequirementStatus,
 } from '../lib/api';
-import { Drawer, FhirDate, Missing } from './primitives';
+import { requestAssist } from '../lib/api';
+import { Drawer, FhirDate, Missing, ResourceRef } from './primitives';
 
 /** How each verdict is worded and coloured. */
 const DETERMINATION_STYLE: Record<
@@ -84,7 +86,13 @@ function Evidence({ item, weak }: { item: EvidenceItem; weak?: boolean }): React
   );
 }
 
-function Requirement({ finding }: { finding: RequirementFinding }): ReactNode {
+function Requirement({
+  finding,
+  assistNote,
+}: {
+  finding: RequirementFinding;
+  assistNote?: string;
+}): ReactNode {
   const style = STATUS_STYLE[finding.status];
   const hiddenRelated = finding.relatedEvidenceTotal - finding.relatedEvidence.length;
 
@@ -95,6 +103,18 @@ function Requirement({ finding }: { finding: RequirementFinding }): ReactNode {
         <span className="checkline__label">{finding.label}</span>
       </div>
       <p className="checkline__why">{finding.rationale}</p>
+
+      {/*
+        The model's restatement sits *under* the deterministic rationale and is
+        labelled, so the two are never mistaken for one another. The status tag
+        above it came from the policy engine either way — nothing the model
+        wrote can move it.
+      */}
+      {assistNote ? (
+        <p className="checkline__why assist-note">
+          <span className="assist-note__tag">AI</span> {assistNote}
+        </p>
+      ) : null}
 
       {finding.evidence.length > 0 ? (
         <ul className="evidence-list">
@@ -143,9 +163,191 @@ function PolicyLine({ policy }: { policy: EligibilityAssessment['policy'] }): Re
   );
 }
 
+type AssistState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; result: AssistResult }
+  | { status: 'error'; message: string };
+
+/**
+ * Requests the AI explanation, on demand only.
+ *
+ * Not `useAsync`: that fires on mount, and this call costs money. A reviewer
+ * asks for it, or it does not happen. The in-flight request is aborted on
+ * unmount so closing the drawer or switching patients does not land a response
+ * against a component that is gone.
+ */
+function useAssist(patientId: string): { state: AssistState; run: () => void } {
+  const [state, setState] = useState<AssistState>({ status: 'idle' });
+  const inFlight = useRef<AbortController | null>(null);
+
+  useEffect(() => () => inFlight.current?.abort(), []);
+
+  const run = useCallback(() => {
+    inFlight.current?.abort();
+    const controller = new AbortController();
+    inFlight.current = controller;
+    setState({ status: 'loading' });
+
+    requestAssist(patientId, undefined, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setState({ status: 'ready', result });
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setState({
+          status: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [patientId]);
+
+  return { state, run };
+}
+
+/**
+ * The one-line clinical summary, with the resources it was drawn from.
+ *
+ * The citations are the reason this is readable at all. A line of generated
+ * clinical prose is worth nothing to a reviewer who cannot check it; the same
+ * line with `Observation/obs-3` beneath it can be opened.
+ */
+function Summary({ result }: { result: AssistResult }): ReactNode {
+  return (
+    <div className="claim">
+      <span className="claim__text">{result.clinicalSummary}</span>
+      <span className="claim__meta">
+        {result.clinicalSummaryEvidence.length > 0 ? (
+          result.clinicalSummaryEvidence.map((ref) => <ResourceRef key={ref} refValue={ref} />)
+        ) : (
+          <Missing
+            label="No evidence — stated as unknown"
+            reason="This summary states that something is not recorded, so there is no resource to cite. It is flagged as a gap rather than presented as a finding."
+          />
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** What produced this explanation, and — when it degraded — what went wrong. */
+function Provenance({ result }: { result: AssistResult }): ReactNode {
+  if (result.provenance.kind === 'model') {
+    return (
+      <p className="hint">
+        Written by <strong>{result.provenance.model}</strong> ({result.provenance.provider}) from the
+        deterministic assessment above, and checked against it. The determination, every requirement
+        status and every citation are the policy engine's, not the model's.
+      </p>
+    );
+  }
+
+  const { reason, detail, violations } = result.provenance;
+  return (
+    <div className="banner banner--gap">
+      <strong>Deterministic explanation ({reason})</strong>
+      <p className="hint" style={{ marginTop: 4 }}>
+        {detail}
+      </p>
+      {violations.length > 0 ? (
+        <ul className="reason-list">
+          {violations.map((entry, index) => (
+            <li key={`${entry.at}-${index}`}>
+              <code className="table__ref">{entry.at}</code> {entry.message}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The AI Assist block.
+ *
+ * Lives inside the drawer, behind a button, below the deterministic checklist —
+ * an ordering that is the whole argument of this section. The verdict a
+ * reviewer acts on is on the page before any model is consulted; this explains
+ * that verdict and cannot change it. When the model fails, the block still
+ * renders an explanation, because the fallback is a complete response rather
+ * than an error state.
+ */
+function AiAssist({
+  patientId,
+  onResult,
+}: {
+  patientId: string;
+  onResult: (result: AssistResult | undefined) => void;
+}): ReactNode {
+  const { state, run } = useAssist(patientId);
+
+  useEffect(() => {
+    onResult(state.status === 'ready' ? state.result : undefined);
+  }, [state, onResult]);
+
+  return (
+    <div className="drawer__section">
+      <div className="panel__head" style={{ paddingLeft: 0, paddingRight: 0 }}>
+        <h3 className="panel__title">AI assist</h3>
+        <span className="panel__note">explains the assessment; cannot change it</span>
+        <div className="panel__actions">
+          <button
+            type="button"
+            className="button"
+            onClick={run}
+            disabled={state.status === 'loading'}
+          >
+            {state.status === 'loading'
+              ? 'Working…'
+              : state.status === 'ready'
+                ? 'Regenerate'
+                : 'Explain this assessment'}
+          </button>
+        </div>
+      </div>
+
+      {state.status === 'idle' ? (
+        <p className="hint">
+          Generates a cited summary and next steps from the checklist above. Every claim it makes
+          either resolves to a FHIR resource id on this patient or is marked as a gap; anything that
+          fails that check is discarded and the deterministic explanation is shown instead.
+        </p>
+      ) : null}
+
+      {state.status === 'error' ? (
+        <div className="banner banner--error">The assist request failed: {state.message}</div>
+      ) : null}
+
+      {state.status === 'ready' ? (
+        <>
+          <Provenance result={state.result} />
+
+          <div className="checkline__subhead">Clinical summary</div>
+          <Summary result={state.result} />
+
+          {state.result.recommendedNextSteps.length > 0 ? (
+            <>
+              <div className="checkline__subhead">Recommended next steps</div>
+              <ol className="reason-list">
+                {state.result.recommendedNextSteps.map((step, index) => (
+                  <li key={index}>{step}</li>
+                ))}
+              </ol>
+            </>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 /** The full working: policy parameters, the checklist, and the outstanding gaps. */
 function AssessmentDetail({ assessment }: { assessment: EligibilityAssessment }): ReactNode {
   const verdict = DETERMINATION_STYLE[assessment.determination];
+  const [assist, setAssist] = useState<AssistResult | undefined>(undefined);
+  const notes = new Map(
+    (assist?.checklist ?? []).map((item) => [item.requirementId, item.note] as const),
+  );
 
   return (
     <>
@@ -168,7 +370,7 @@ function AssessmentDetail({ assessment }: { assessment: EligibilityAssessment })
 
       <div className="checklist">
         {assessment.requirements.map((finding) => (
-          <Requirement key={finding.id} finding={finding} />
+          <Requirement key={finding.id} finding={finding} assistNote={notes.get(finding.id)} />
         ))}
       </div>
 
@@ -189,6 +391,8 @@ function AssessmentDetail({ assessment }: { assessment: EligibilityAssessment })
           </div>
         </div>
       ) : null}
+
+      <AiAssist patientId={assessment.patientId} onResult={setAssist} />
 
       <div className="drawer__section">
         <p className="hint">

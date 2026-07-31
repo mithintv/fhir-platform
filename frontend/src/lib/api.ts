@@ -42,8 +42,17 @@ export type {
   UnknownReason,
 } from '@autonomy/backend/eligibility-dto';
 
+export type {
+  AssistChecklistItem,
+  AssistProvenance,
+  AssistResult,
+  AssistViolation,
+  DegradeReason,
+} from '@autonomy/backend/assist-dto';
+
 import type { ClinicalSnapshot, PatientSearchResult, StoreMeta, TimelinePage } from '@autonomy/backend/dto';
 import type { CohortReport, EligibilityAssessment } from '@autonomy/backend/eligibility-dto';
+import type { AssistResult } from '@autonomy/backend/assist-dto';
 
 /** An API error carrying the status, so callers can distinguish 404 from 500. */
 export class ApiError extends Error {
@@ -62,8 +71,8 @@ export class ApiError extends Error {
  * Error bodies share one shape (`{ error, detail }`), so failures surface with
  * the server's own explanation rather than a bare status code.
  */
-async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(path, { signal, headers: { accept: 'application/json' } });
+async function request<T>(method: string, path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(path, { method, signal, headers: { accept: 'application/json' } });
 
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as
@@ -74,6 +83,8 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 
   return (await response.json()) as T;
 }
+
+const get = <T,>(path: string, signal?: AbortSignal): Promise<T> => request<T>('GET', path, signal);
 
 export function fetchStoreMeta(signal?: AbortSignal): Promise<StoreMeta> {
   return get<StoreMeta>('/api/meta', signal);
@@ -126,6 +137,30 @@ export function fetchEligibility(
   if (asOf) search.set('asOf', asOf);
   return get<EligibilityAssessment>(
     `/api/patients/${encodeURIComponent(patientId)}/eligibility?${search}`,
+    signal,
+  );
+}
+
+/**
+ * The AI-assisted explanation for one patient.
+ *
+ * POST, and never fired on mount: the call costs money, and a GET would license
+ * a browser or a prefetching link to spend it without a reviewer asking. The
+ * response is always a complete result — a provider failure comes back as a
+ * deterministic explanation with `provenance.kind === 'deterministic'`, not as
+ * an HTTP error — so the only failures this can reject with are a 404 for an
+ * unknown patient and a genuine transport problem.
+ */
+export function requestAssist(
+  patientId: string,
+  asOf?: string,
+  signal?: AbortSignal,
+): Promise<AssistResult> {
+  const search = new URLSearchParams();
+  if (asOf) search.set('asOf', asOf);
+  return request<AssistResult>(
+    'POST',
+    `/api/patients/${encodeURIComponent(patientId)}/assist?${search}`,
     signal,
   );
 }
