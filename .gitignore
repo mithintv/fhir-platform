@@ -1,8 +1,5 @@
-**/.claude/
-
 **/*.pdf
 **/sample-bulk-fhir-datasets-1000-patients/
-
 
 **/dist/
 **/node_modules
