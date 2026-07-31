@@ -8,6 +8,7 @@
  * specifically was looked for and not found.
  */
 import type { ReactNode } from 'react';
+import { useEffect, useRef } from 'react';
 import type { DateInfo } from '../lib/api';
 import { formatDate, precisionNote } from '../lib/format';
 
@@ -111,6 +112,94 @@ export function AsyncState({
   if (loading) return <div className="empty">Loading…</div>;
   if (empty) return <div className="empty">{emptyLabel ?? 'Nothing to show.'}</div>;
   return <>{children}</>;
+}
+
+/**
+ * A right-anchored, full-height drawer.
+ *
+ * Modal rather than a slide-out that leaves the page live behind it: the
+ * eligibility checklist is a decision surface, and a reviewer working through
+ * it should not be able to change the selected patient underneath it and end up
+ * reading one patient's requirements beside another's chart.
+ *
+ * The keyboard contract is the part that is easy to skip and shouldn't be:
+ * Escape closes, focus moves into the drawer on open and returns to whatever
+ * opened it on close, and the background scroll is locked so the page behind
+ * does not drift while the drawer is scrolled.
+ */
+export function Drawer({
+  open,
+  title,
+  note,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  title: string;
+  note?: ReactNode;
+  onClose: () => void;
+  children: ReactNode;
+}): ReactNode {
+  const panel = useRef<HTMLDivElement>(null);
+  const restoreFocusTo = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    restoreFocusTo.current = document.activeElement as HTMLElement | null;
+    panel.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      // Guarded: the element that opened the drawer may have unmounted with a
+      // patient switch, and focusing a detached node throws focus to <body>.
+      if (restoreFocusTo.current?.isConnected) restoreFocusTo.current.focus();
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div className="drawer-layer">
+      {/*
+        The scrim is a button, not a div with onClick: click-to-dismiss should
+        not be the only way out, and making it focusable-and-labelled means the
+        affordance exists for a keyboard user too.
+      */}
+      <button
+        type="button"
+        className="drawer__scrim"
+        aria-label={`Close ${title}`}
+        onClick={onClose}
+      />
+      <div
+        className="drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+        ref={panel}
+      >
+        <div className="drawer__head">
+          <h2 className="drawer__title">{title}</h2>
+          {note ? <span className="panel__note">{note}</span> : null}
+          <button type="button" className="button drawer__close" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="drawer__body">{children}</div>
+      </div>
+    </div>
+  );
 }
 
 /**

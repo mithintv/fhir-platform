@@ -11,6 +11,7 @@ import { getClinicalSnapshot } from '../query/snapshot.js';
 import { getStoreMeta } from '../query/meta.js';
 import { searchPatients } from '../query/patients.js';
 import { getResource, getTimeline, TIMELINE_TYPES } from '../query/timeline.js';
+import { assessCohort, assessPatient } from '../eligibility/index.js';
 
 export interface ApiResponse {
   status: number;
@@ -62,6 +63,25 @@ function typesParam(
 }
 
 /**
+ * Reads the `?asOf=` review date.
+ *
+ * Absent means "let the policy choose", which resolves to the store's data
+ * horizon — see `resolveAsOf`. A malformed value is rejected rather than
+ * ignored: silently falling back to the default would score the cohort against
+ * a different date than the caller asked for and label it as if it had not.
+ */
+function asOfParam(
+  params: URLSearchParams,
+): { ok: true; value: string | undefined } | { ok: false; message: string } {
+  const raw = params.get('asOf');
+  if (raw === null || raw.trim() === '') return { ok: true, value: undefined };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(Date.parse(`${raw}T00:00:00Z`))) {
+    return { ok: false, message: `asOf must be a YYYY-MM-DD date, got "${raw}"` };
+  }
+  return { ok: true, value: raw };
+}
+
+/**
  * Resolves one request.
  *
  * `now` is injected so snapshot ages are deterministic under test.
@@ -107,6 +127,28 @@ export function route(
     const snapshot = getClinicalSnapshot(db, patientId, now);
     return snapshot
       ? { status: 200, body: snapshot }
+      : fail(404, 'patient-not-found', patientId);
+  }
+
+  // GET /api/cohort/eligibility?asOf=
+  //
+  // Ahead of the /api/patients routes only in reading order; the segment match
+  // below is exact, so ordering between them carries no meaning.
+  if (segments.length === 3 && segments[1] === 'cohort' && segments[2] === 'eligibility') {
+    const asOf = asOfParam(params);
+    if (!asOf.ok) return fail(400, 'bad-request', asOf.message);
+    return { status: 200, body: assessCohort(db, { requested: asOf.value }).report };
+  }
+
+  // GET /api/patients/:id/eligibility?asOf=
+  if (segments.length === 4 && segments[1] === 'patients' && segments[3] === 'eligibility') {
+    const patientId = decodeURIComponent(segments[2] as string);
+    const asOf = asOfParam(params);
+    if (!asOf.ok) return fail(400, 'bad-request', asOf.message);
+
+    const assessment = assessPatient(db, patientId, { requested: asOf.value });
+    return assessment
+      ? { status: 200, body: assessment }
       : fail(404, 'patient-not-found', patientId);
   }
 

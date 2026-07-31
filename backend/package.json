@@ -7,14 +7,16 @@
   "engines": {
     "node": ">=20"
   },
-  "//exports": "Only the wire types are exported. `dto.ts` is pure type declarations with no imports, so nothing reachable from here can pull node:sqlite into a browser bundle. Server code is imported by path within this package.",
+  "//exports": "Only the wire types are exported. Both entries are type declarations whose only imports are `import type` of each other, so nothing reachable from here can pull node:sqlite into a browser bundle. Server code is imported by path within this package.",
   "exports": {
-    "./dto": "./src/query/dto.ts"
+    "./dto": "./src/query/dto.ts",
+    "./eligibility-dto": "./src/eligibility/dto.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "ingest": "tsx src/cli.ts ingest",
+    "cohort": "tsx src/cli.ts cohort",
     "bench": "tsx src/cli.ts bench",
     "serve": "tsx src/api/main.ts",
     "dev": "tsx src/api/main.ts",

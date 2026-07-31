@@ -5,14 +5,16 @@
  *   ingest    parse the bulk export into the SQLite store
  *   bench     measure performance — stage breakdown by default,
  *             `--variants legacy@1,1` to compare whole configurations
- *   serve     read-only JSON API over the store, for the review UI
+ *   cohort    apply the Part C eligibility policy across every patient
  */
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { defaultWorkerCount, runIngest } from './ingest/run.js';
 import type { IngestOptions, IngestResult } from './ingest/run.js';
 import { profileIngest } from './bench/profile.js';
-import { startServer } from './api/server.js';
+import { closeDatabase, openDatabase } from './store/db.js';
+import { assessCohort } from './eligibility/index.js';
+import type { CohortReport, EligibilityAssessment } from './eligibility/index.js';
 import type { IngestStats } from './ingest/stats.js';
 import type { VerificationReport } from './ingest/verify.js';
 
@@ -185,7 +187,132 @@ const SHARED_OPTIONS = {
   port: { type: 'string' },
   static: { type: 'string' },
   'dev-origin': { type: 'string' },
+  'as-of': { type: 'string' },
+  json: { type: 'boolean' },
+  examples: { type: 'string' },
 } as const;
+
+/** A count with its share of a whole, e.g. `1,067  94.3%`. */
+function fmtShare(count: number, share: number): string {
+  return `${fmtNum(count).padStart(8)}${`${share.toFixed(1)}%`.padStart(9)}`;
+}
+
+/**
+ * Prints the cohort eligibility report.
+ *
+ * Ordered the way the numbers should be read: what was assessed and under what
+ * parameters, then the three categories, then — because `unknown` is the
+ * interesting bucket in this dataset — the two complementary breakdowns of it,
+ * then the coverage facts that explain why the breakdown looks the way it does.
+ */
+function printCohortReport(report: CohortReport): void {
+  const { policy, context } = report;
+
+  console.log(`\n${policy.label}  (${policy.id} v${policy.version})`);
+  console.log(
+    `  BMI >= ${policy.bmiSoleThreshold} alone, or >= ${policy.bmiWithComorbidityThreshold} with a comorbidity; ` +
+      `BMI must fall within ${policy.observationLookbackMonths} months of the review date.`,
+  );
+  console.log(`  as of ${policy.asOf}  (${policy.asOfSource})   lookback from ${policy.lookbackStart}`);
+  if (policy.asOfSource === 'store-latest-clinical-date') {
+    console.log(
+      '  This export ends there, so the review date is anchored to the data rather than to today.',
+    );
+    console.log('  Pass --as-of YYYY-MM-DD to score the cohort against a different date.');
+  }
+
+  console.log(`\nCohort: ${fmtNum(report.totalPatients)} patients with a Patient resource`);
+  console.log('\n  determination            patients    share');
+  for (const category of report.categories) {
+    console.log(`  ${category.determination.padEnd(22)}${fmtShare(category.count, category.percent)}`);
+  }
+
+  if (report.unknownReasons.length > 0) {
+    console.log('\nTop reasons for unknown  (a patient can carry more than one, so rows overlap)');
+    console.log('  reason                                        patients   of unknown   of cohort');
+    for (const reason of report.unknownReasons) {
+      console.log(
+        `  ${reason.label.padEnd(44)}${fmtNum(reason.patients).padStart(9)}` +
+          `${`${reason.percentOfUnknown.toFixed(1)}%`.padStart(13)}` +
+          `${`${reason.percentOfCohort.toFixed(1)}%`.padStart(12)}`,
+      );
+    }
+
+    console.log('\nUnknown patients by their exact set of gaps  (mutually exclusive)');
+    console.log('  gaps                                                          patients   share');
+    for (const combination of report.unknownCombinations.slice(0, 12)) {
+      const label = combination.reasons.join(' + ');
+      console.log(
+        `  ${(label.length > 58 ? `${label.slice(0, 57)}…` : label).padEnd(60)}` +
+          `${fmtNum(combination.patients).padStart(8)}` +
+          `${`${combination.percentOfUnknown.toFixed(1)}%`.padStart(9)}`,
+      );
+    }
+    if (report.unknownCombinations.length > 12) {
+      console.log(`  … ${report.unknownCombinations.length - 12} more`);
+    }
+  }
+
+  console.log('\nHow far each arm of the policy reaches');
+  const line = (label: string, value: number) =>
+    console.log(`  ${label.padEnd(52)}${fmtNum(value).padStart(9)}`);
+  line('patients with any BMI observation', context.patientsWithAnyBmi);
+  line('… with one inside the lookback window', context.patientsWithBmiInWindow);
+  line(`… meeting BMI >= ${report.policy.bmiSoleThreshold} on its own`, context.patientsMeetingBmiSoleThreshold);
+  line('… in the 35–40 band with a coded comorbidity', context.patientsMeetingBmiWithComorbidity);
+  line('… in the 35–40 band with none coded', context.patientsInBmiBandWithoutComorbidity);
+  line('patients with documented weight-loss attempts', context.patientsWithWeightLossDocumentation);
+  line('patients with a psychological evaluation', context.patientsWithPsychEvaluation);
+  line('patients with both documentation requirements', context.patientsWithBothDocuments);
+  line('deceased patients in the cohort', context.deceasedPatients);
+
+  const reachable = report.codeCoverage.filter((entry) => entry.resources > 0);
+  console.log(
+    `\nPolicy code coverage: ${reachable.length} of ` +
+      `${report.codeCoverage.length + report.unmatchedPolicyCodes.length} codes match at least one resource ` +
+      `(${report.unmatchedPolicyCodes.length} absent from the coding dictionary entirely).`,
+  );
+  const documentationSets = new Set(['weight-loss', 'psych-evaluation']);
+  const documentationCodes = report.codeCoverage.filter((entry) => documentationSets.has(entry.setId));
+  if (documentationCodes.length > 0) {
+    console.log('  accepted documentation codes, by patients reached:');
+    for (const entry of documentationCodes) {
+      console.log(
+        `    ${entry.setId.padEnd(18)}${entry.code.padEnd(16)}${fmtNum(entry.patients).padStart(7)} patients   ${entry.display}`,
+      );
+    }
+  }
+
+  if (report.danglingSubjectPatients > 0) {
+    console.log(
+      `\nNote: ${fmtNum(report.danglingSubjectPatients)} further subject ids are referenced by resources but have no ` +
+        'Patient resource in this export, so they are outside the cohort.',
+    );
+  }
+  console.log(`\nComputed in ${report.computeMs.toFixed(0)} ms.`);
+}
+
+/** Prints a few worked examples, so the report can be checked against a patient. */
+function printExamples(assessments: EligibilityAssessment[], limit: number): void {
+  // Closest first: the patients with the fewest unresolved requirements are the
+  // ones a reviewer would actually chase.
+  const interesting = assessments
+    .filter((assessment) => assessment.determination === 'unknown')
+    .sort((a, b) => a.unknownReasons.length - b.unknownReasons.length)
+    .slice(0, limit);
+
+  console.log(`\nClosest ${interesting.length} unknown patient(s) to a determination`);
+  for (const assessment of interesting) {
+    console.log(`\n  ${assessment.patientRef}  →  ${assessment.determination}`);
+    for (const requirement of assessment.requirements) {
+      console.log(`    [${requirement.status.padEnd(14)}] ${requirement.label}`);
+      console.log(`       ${requirement.rationale}`);
+      for (const item of requirement.evidence) {
+        console.log(`       evidence: ${item.ref}${item.value ? ` = ${item.value}` : ''}`);
+      }
+    }
+  }
+}
 
 /**
  * Dispatches the subcommand named by the first argument, defaulting to
@@ -330,9 +457,31 @@ async function main(): Promise<void> {
       break;
     }
 
+    case 'cohort': {
+      const dbPath = (values['db'] as string) ?? DEFAULT_DB;
+      const db = openDatabase(dbPath);
+      try {
+        const requested = values['as-of'] as string | undefined;
+        const { report, assessments } = assessCohort(db, requested ? { requested } : {});
+
+        if (values['json'] === true) {
+          console.log(JSON.stringify(report, null, 2));
+          break;
+        }
+
+        printCohortReport(report);
+
+        const examples = Number(values['examples'] ?? 0);
+        if (examples > 0) printExamples(assessments, examples);
+      } finally {
+        closeDatabase(db);
+      }
+      break;
+    }
+
     default:
       console.error(`Unknown command: ${command}`);
-      console.error('Usage: cli.ts <ingest|bench|serve> [options]');
+      console.error('Usage: cli.ts <ingest|bench|cohort> [options]');
       process.exitCode = 1;
   }
 }

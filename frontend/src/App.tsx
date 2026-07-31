@@ -9,11 +9,13 @@
  */
 import type { ReactNode } from 'react';
 import { useState } from 'react';
-import { fetchSnapshot, fetchStoreMeta, useAsync } from './lib/api';
+import { fetchEligibility, fetchSnapshot, fetchStoreMeta, useAsync } from './lib/api';
 import { formatCount } from './lib/format';
 import { PatientSelector } from './components/PatientSelector';
 import { Snapshot } from './components/Snapshot';
 import { Timeline } from './components/Timeline';
+import { Eligibility } from './components/Eligibility';
+import { CohortReport } from './components/CohortReport';
 import { SnapshotSkeleton } from './components/primitives';
 
 function StoreBadge(): ReactNode {
@@ -61,6 +63,53 @@ function StoreBadge(): ReactNode {
  * screen for the duration of the fetch, indistinguishable from the current one.
  * Remounting means there is no previous result to show.
  */
+/**
+ * The eligibility panel, fetched independently of the snapshot.
+ *
+ * Separate request on purpose: the assessment reads different tables and can be
+ * slower than the snapshot, and a reviewer should get the clinical picture as
+ * soon as it is ready rather than waiting on the verdict. A failure here is
+ * reported in place — it must never take the clinical view down with it, and it
+ * must never be silently omitted, because a missing eligibility panel is
+ * indistinguishable from a patient who has not been assessed.
+ */
+function EligibilitySection({ patientId }: { patientId: string }): ReactNode {
+  const assessment = useAsync((signal) => fetchEligibility(patientId, undefined, signal), [
+    patientId,
+  ]);
+
+  if (assessment.error) {
+    return (
+      <section className="verdict-bar verdict--alert">
+        <div className="verdict-bar__main">
+          <div className="verdict-bar__label">Bariatric surgery eligibility</div>
+          <div className="verdict-bar__word">Unavailable</div>
+          {/*
+            Reported in place rather than omitted: a missing eligibility bar is
+            indistinguishable from a patient nobody has assessed.
+          */}
+          <p className="verdict__rationale">Eligibility could not be computed: {assessment.error}</p>
+        </div>
+      </section>
+    );
+  }
+
+  if (!assessment.data) {
+    return (
+      <section className="verdict-bar">
+        <div className="verdict-bar__main">
+          <div className="verdict-bar__label">Bariatric surgery eligibility</div>
+          <div className="verdict-bar__word">
+            <span className="skeleton skeleton--metric" />
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  return <Eligibility assessment={assessment.data} />;
+}
+
 function PatientView({ patientId }: { patientId: string }): ReactNode {
   const snapshot = useAsync((signal) => fetchSnapshot(patientId, signal), [patientId]);
 
@@ -84,33 +133,69 @@ function PatientView({ patientId }: { patientId: string }): ReactNode {
 
   return (
     <>
+      {/*
+        The determination leads. This is a prior-authorization tool: the reviewer
+        is here to answer one question, and the snapshot below is the context
+        that supports it rather than the other way round.
+      */}
+      <EligibilitySection patientId={patientId} />
       <Snapshot snapshot={snapshot.data} />
       <Timeline patientId={patientId} />
     </>
   );
 }
 
+type View = 'patient' | 'cohort';
+
 export function App(): ReactNode {
   const [patientId, setPatientId] = useState<string | undefined>(undefined);
+  const [view, setView] = useState<View>('patient');
+
+  /** Selecting a patient implies wanting to see them, so it leaves the report. */
+  const selectPatient = (id: string): void => {
+    setPatientId(id);
+    setView('patient');
+  };
 
   return (
     <div className="app">
       <header className="masthead">
         <h1 className="masthead__title">Prior Authorization Review</h1>
         <span className="hint">FHIR bulk export · read-only</span>
+        <nav className="masthead__views" aria-label="View">
+          <button
+            type="button"
+            className={view === 'patient' ? 'button button--on' : 'button'}
+            aria-pressed={view === 'patient'}
+            onClick={() => setView('patient')}
+          >
+            Patient review
+          </button>
+          <button
+            type="button"
+            className={view === 'cohort' ? 'button button--on' : 'button'}
+            aria-pressed={view === 'cohort'}
+            onClick={() => setView('cohort')}
+          >
+            Cohort report
+          </button>
+        </nav>
         <StoreBadge />
       </header>
 
       <div className="app__body">
-        <PatientSelector selectedId={patientId} onSelect={setPatientId} />
+        <PatientSelector selectedId={patientId} onSelect={selectPatient} />
 
         <main className="main">
-          {patientId ? (
+          {view === 'cohort' ? (
+            <CohortReport />
+          ) : patientId ? (
             // `key` is load-bearing — see PatientView.
             <PatientView key={patientId} patientId={patientId} />
           ) : (
             <div className="banner">
-              Select a patient to review their clinical snapshot and timeline.
+              Select a patient to review their eligibility, clinical snapshot and timeline — or open
+              the cohort report for the whole population.
             </div>
           )}
         </main>

@@ -5,7 +5,8 @@
   "description": "FHIR prior-authorization review tool",
   "scripts": {
     "ingest": "pnpm --filter @autonomy/backend exec tsx src/cli.ts ingest",
-    "api": "pnpm --filter @autonomy/backend exec tsx src/cli.ts serve",
+    "api": "pnpm --filter @autonomy/backend serve",
+    "cohort": "pnpm --filter @autonomy/backend cohort",
     "ui": "pnpm --filter @autonomy/frontend dev",
     "dev": "pnpm --parallel --filter \"@autonomy/*\" dev",
     "build": "pnpm --filter @autonomy/frontend build",

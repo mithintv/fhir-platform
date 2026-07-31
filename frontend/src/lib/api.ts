@@ -27,7 +27,23 @@ export type {
   TimelineResourceType,
 } from '@autonomy/backend/dto';
 
+export type {
+  CohortCategory,
+  CohortReport,
+  CohortUnknownCombination,
+  CohortUnknownReason,
+  Determination,
+  EligibilityAssessment,
+  EvidenceItem,
+  PolicySummary,
+  RequirementFinding,
+  RequirementId,
+  RequirementStatus,
+  UnknownReason,
+} from '@autonomy/backend/eligibility-dto';
+
 import type { ClinicalSnapshot, PatientSearchResult, StoreMeta, TimelinePage } from '@autonomy/backend/dto';
+import type { CohortReport, EligibilityAssessment } from '@autonomy/backend/eligibility-dto';
 
 /** An API error carrying the status, so callers can distinguish 404 from 500. */
 export class ApiError extends Error {
@@ -92,6 +108,32 @@ export function fetchTimeline(
     `/api/patients/${encodeURIComponent(patientId)}/timeline?${search}`,
     signal,
   );
+}
+
+/**
+ * The deterministic eligibility assessment for one patient.
+ *
+ * `asOf` is optional and normally omitted: the server anchors the review date to
+ * the store's newest clinical date rather than to the browser's clock, and the
+ * response says which it used.
+ */
+export function fetchEligibility(
+  patientId: string,
+  asOf?: string,
+  signal?: AbortSignal,
+): Promise<EligibilityAssessment> {
+  const search = new URLSearchParams();
+  if (asOf) search.set('asOf', asOf);
+  return get<EligibilityAssessment>(
+    `/api/patients/${encodeURIComponent(patientId)}/eligibility?${search}`,
+    signal,
+  );
+}
+
+export function fetchCohortReport(asOf?: string, signal?: AbortSignal): Promise<CohortReport> {
+  const search = new URLSearchParams();
+  if (asOf) search.set('asOf', asOf);
+  return get<CohortReport>(`/api/cohort/eligibility?${search}`, signal);
 }
 
 /** What a component needs to render one request: the three states, explicitly. */

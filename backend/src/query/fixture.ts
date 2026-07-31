@@ -94,6 +94,54 @@ export function condition(
   };
 }
 
+/**
+ * Any resource carrying a single coding on its type-appropriate code element.
+ *
+ * The eligibility tests need Procedures, Encounters and MedicationRequests
+ * bearing *specific* SNOMED/RxNorm codes, because the policy matches on
+ * `(system, code)` — the fixed-code helpers below cannot express that.
+ */
+export function codedResource(
+  resourceType: string,
+  id: string,
+  coding: { system: string; code: string; display?: string },
+  date: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const concept = {
+    coding: [coding],
+    text: coding.display ?? `${coding.system}|${coding.code}`,
+  };
+  // FHIR does not put "what this resource is" in one place, and neither does
+  // the normalizer — MedicationRequest reads `medicationCodeableConcept`,
+  // Encounter reads `type[]`, everything else reads `code`.
+  const codeElement =
+    resourceType === 'MedicationRequest'
+      ? { medicationCodeableConcept: concept }
+      : resourceType === 'Encounter'
+        ? { type: [concept] }
+        : { code: concept };
+
+  const dateElement =
+    resourceType === 'Procedure'
+      ? { performedDateTime: date }
+      : resourceType === 'MedicationRequest'
+        ? { authoredOn: date }
+        : resourceType === 'Encounter'
+          ? { period: { start: date } }
+          : { effectiveDateTime: date };
+
+  return {
+    resourceType,
+    id,
+    status: 'completed',
+    subject: { reference: 'Patient/p1' },
+    ...codeElement,
+    ...dateElement,
+    ...extra,
+  };
+}
+
 export function procedure(
   id: string,
   display: string,
