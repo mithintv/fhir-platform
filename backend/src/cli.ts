@@ -3,16 +3,16 @@
  * Ingest CLI.
  *
  *   ingest    parse the bulk export into the SQLite store
- *   profile   measure where single-threaded time actually goes
- *   bench     run the same ingest at several worker counts and compare
- *   stats     print the data-quality report from an existing store
+ *   bench     measure performance — stage breakdown by default,
+ *             `--variants legacy@1,1` to compare whole configurations
+ *   serve     read-only JSON API over the store, for the review UI
  */
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
-import { openDatabase, readMeta } from './store/db.js';
 import { defaultWorkerCount, runIngest } from './ingest/run.js';
 import type { IngestOptions, IngestResult } from './ingest/run.js';
 import { profileIngest } from './bench/profile.js';
+import { startServer } from './api/server.js';
 import type { IngestStats } from './ingest/stats.js';
 import type { VerificationReport } from './ingest/verify.js';
 
@@ -179,7 +179,12 @@ const SHARED_OPTIONS = {
   'no-verify': { type: 'boolean' },
   quiet: { type: 'boolean' },
   'sample-mb': { type: 'string' },
+  deep: { type: 'boolean' },
   list: { type: 'string' },
+  variants: { type: 'string' },
+  port: { type: 'string' },
+  static: { type: 'string' },
+  'dev-origin': { type: 'string' },
 } as const;
 
 /**
@@ -205,11 +210,18 @@ async function main(): Promise<void> {
       break;
     }
 
-    case 'profile': {
+    case 'bench': {
+      // One command, two questions:
+      //   no flags     which STAGE of a run is slow    — samples 250 MB, ~10s
+      //   --variants   which CONFIGURATION is faster   — full runs, ~40s each
+      // The cheap sampled breakdown is the default because it is what tells you
+      // what to change; the comparison is what proves the change worked.
+      if (values['variants'] === undefined && values['list'] === undefined) {
+
       const sourceDir = (values['source'] as string) ?? DEFAULT_SOURCE;
       const sampleBytes = Number(values['sample-mb'] ?? 250) * MB;
-      console.log(`Profiling ${sourceDir} (~${fmtBytes(sampleBytes)} sample)\n`);
-      const result = await profileIngest(sourceDir, sampleBytes);
+      console.log(`Stage breakdown for ${sourceDir} (~${fmtBytes(sampleBytes)} sample)\n`);
+      const result = await profileIngest(sourceDir, sampleBytes, values['deep'] === true);
 
       console.log(
         `Sample: ${fmtBytes(result.sampledBytes)} across ${result.chunkCount} chunks, ` +
@@ -228,23 +240,71 @@ async function main(): Promise<void> {
         `\nProjected single-threaded full run over ${fmtBytes(result.totalSourceBytes)}: ` +
           `${result.projectedFullRunSeconds.toFixed(0)}s`,
       );
-      break;
-    }
 
-    case 'bench': {
-      const list = String(values['list'] ?? `1,${defaultWorkerCount()}`)
+      const detail = result.storeDetail;
+      if (detail) {
+        console.log(
+          `\nStore breakdown — ${fmtNum(detail.resources)} resources, ` +
+            `${fmtBytes(detail.jsonBytes)} of JSON, ${detail.avgJsonBytes.toFixed(0)} B/resource`,
+        );
+        console.log(
+          `  rows: ${fmtNum(detail.rows.resources)} resource + ` +
+            `${fmtNum(detail.rows.resourceCodings)} coding-link + ` +
+            `${fmtNum(detail.rows.components)} component  ` +
+            `(${fmtNum(detail.rows.distinctCodings)} distinct codings)\n`,
+        );
+        const row = (label: string, ms: number) =>
+          console.log(`  ${label.padEnd(38)}${fmtSec(ms).padStart(9)}`);
+        row('JSON.stringify only', detail.stringifyMs);
+        row('insert resource rows (with blob)', detail.resourceOnlyMs);
+        row('insert resource rows (no blob)', detail.noBlobMs);
+        row('full writer (all tables)', detail.fullMs);
+        console.log('');
+        row('attributable to the JSON blob', detail.blobMs);
+        row('attributable to side tables', detail.sideTableMs);
+      }
+        break;
+      }
+
+
+      // A variant is `[schema@]workers` — e.g. `1`, `8`, `legacy@1`.
+      // `legacy` selects the pre-optimization flat coding table, so the
+      // before/after in docs/PART_A.md is reproducible rather than asserted.
+      const spec = String(values['variants'] ?? values['list'] ?? 'legacy@1,1');
+      const variants = spec
         .split(',')
-        .map((entry) => Number(entry.trim()))
-        .filter((entry) => Number.isInteger(entry) && entry > 0);
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .map((entry) => {
+          const [head, tail] = entry.includes('@') ? entry.split('@') : ['current', entry];
+          const workers = Number(tail);
+          if (!Number.isInteger(workers) || workers < 1) {
+            throw new Error(`bad variant "${entry}" — expected [legacy@]<workers>`);
+          }
+          const legacyCodings = head === 'legacy';
+          if (head !== 'legacy' && head !== 'current') {
+            throw new Error(`bad variant "${entry}" — schema must be "legacy" or "current"`);
+          }
+          return {
+            label: `${legacyCodings ? 'legacy' : 'current'} @ ${workers}w`,
+            workers,
+            legacyCodings,
+          };
+        });
 
-      const results: { workers: number; result: IngestResult }[] = [];
-      for (const workers of list) {
+      const results: { label: string; result: IngestResult }[] = [];
+      for (const variant of variants) {
         // Verification re-reads the whole source; excluded so it cannot
         // distort the timings being compared.
-        const options = { ...ingestOptionsFrom(values), workers, verify: false };
-        console.log(`\n=== ${workers} worker${workers === 1 ? '' : 's'} ===`);
+        const options = {
+          ...ingestOptionsFrom(values),
+          workers: variant.workers,
+          legacyCodings: variant.legacyCodings,
+          verify: false,
+        };
+        console.log(`\n=== ${variant.label} ===`);
         const result = await runIngest(options);
-        results.push({ workers, result });
+        results.push({ label: variant.label, result });
         console.log(
           `  load ${fmtSec(result.timings.loadMs)}  index ${fmtSec(result.timings.indexMs)}  ` +
             `total ${fmtSec(result.timings.totalMs)}`,
@@ -253,14 +313,15 @@ async function main(): Promise<void> {
 
       const baseline = results[0];
       if (!baseline) break;
-      console.log('\nBefore / after');
-      console.log('  workers        load       total     speedup   resources');
-      for (const { workers, result } of results) {
-        const speedup = baseline.result.timings.loadMs / result.timings.loadMs;
+      console.log('\nComparison (first row is the baseline)');
+      console.log('  variant                  load       index       total     speedup   resources');
+      for (const { label, result } of results) {
+        const speedup = baseline.result.timings.totalMs / result.timings.totalMs;
         const resources = Object.values(result.stats.resourceCounts).reduce((a, b) => a + b, 0);
         console.log(
-          `  ${String(workers).padStart(7)}` +
-            `${fmtSec(result.timings.loadMs).padStart(12)}` +
+          `  ${label.padEnd(20)}` +
+            `${fmtSec(result.timings.loadMs).padStart(11)}` +
+            `${fmtSec(result.timings.indexMs).padStart(12)}` +
             `${fmtSec(result.timings.totalMs).padStart(12)}` +
             `${speedup.toFixed(2).padStart(11)}x` +
             `${fmtNum(resources).padStart(12)}`,
@@ -269,38 +330,9 @@ async function main(): Promise<void> {
       break;
     }
 
-    case 'stats': {
-      const dbPath = (values['db'] as string) ?? DEFAULT_DB;
-      const db = openDatabase(dbPath, { readOnly: true });
-      const stats = readMeta<IngestStats>(db, 'stats');
-      if (!stats) {
-        console.error(`No ingest metadata in ${dbPath} — run \`ingest\` first.`);
-        process.exitCode = 1;
-        break;
-      }
-      const patients = db.prepare('SELECT count(*) AS n FROM patient').get() as { n: number };
-      const resources = db.prepare('SELECT count(*) AS n FROM resource').get() as { n: number };
-      const orphans = db
-        .prepare(
-          `SELECT count(DISTINCT r.patient_id) AS n FROM resource r
-             LEFT JOIN patient p ON p.id = r.patient_id
-            WHERE r.patient_id IS NOT NULL AND p.id IS NULL`,
-        )
-        .get() as { n: number };
-
-      console.log(`Store ${dbPath}`);
-      console.log(`  patients                               ${fmtNum(patients.n).padStart(12)}`);
-      console.log(`  resources                              ${fmtNum(resources.n).padStart(12)}`);
-      console.log(`  referenced-but-missing patients        ${fmtNum(orphans.n).padStart(12)}`);
-      printStats(stats);
-      reconcile(stats);
-      db.close();
-      break;
-    }
-
     default:
       console.error(`Unknown command: ${command}`);
-      console.error('Usage: cli.ts <ingest|profile|bench|stats> [options]');
+      console.error('Usage: cli.ts <ingest|bench|serve> [options]');
       process.exitCode = 1;
   }
 }

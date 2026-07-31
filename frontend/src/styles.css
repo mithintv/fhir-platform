@@ -1,0 +1,603 @@
+/*
+ * Visual system for the review tool.
+ *
+ * The brief ranks information hierarchy above visual polish, so the design is
+ * built from that constraint rather than decorated afterwards:
+ *
+ * - One accent colour (teal) and it means "interactive". Nothing decorative
+ *   uses it, so anything teal can be clicked.
+ * - Colour is otherwise reserved for data quality. Amber means "the record does
+ *   not say", red means "the record contradicts itself". A screen with no amber
+ *   on it is a complete record, readable at a glance from across a desk.
+ * - Clinical values use tabular numerals so a column of BMI readings aligns on
+ *   the decimal point and can be scanned vertically.
+ * - FHIR ids are monospaced. They are identifiers to be matched and copied, not
+ *   prose, and the shift in typeface says so without a label.
+ * - Density is deliberately high. A reviewer comparing a timeline against a
+ *   policy wants rows on screen, not whitespace.
+ */
+
+:root {
+  --canvas: #f7f6f4;
+  --surface: #ffffff;
+  --surface-sunken: #faf9f7;
+
+  --ink: #17181a;
+  --ink-muted: #5f6266;
+  --ink-faint: #8a8d92;
+
+  --line: #e4e2de;
+  --line-strong: #cfccc6;
+
+  --accent: #0f6466;
+  --accent-ink: #0b4c4e;
+  --accent-soft: #e7f0ef;
+
+  /* Data-quality signals. */
+  --gap-ink: #85641b;
+  --gap-soft: #fbf3df;
+  --gap-line: #e8d6a6;
+  --alert-ink: #9d2f26;
+  --alert-soft: #fbeae8;
+
+  --radius: 6px;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------------------------------------------------------------- layout -- */
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+}
+
+.app__body {
+  display: grid;
+  grid-template-columns: 330px 1fr;
+  min-height: 0;
+}
+
+.masthead {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.masthead__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.masthead__meta {
+  margin-left: auto;
+  display: flex;
+  gap: 18px;
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar {
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  min-height: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+}
+
+.main {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 20px 24px 64px;
+}
+
+/* -------------------------------------------------------------- selector -- */
+
+.selector__header {
+  padding: 14px 16px 10px;
+}
+
+.selector__label {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.selector__search {
+  padding: 0 16px 12px;
+}
+
+.search-input {
+  width: 100%;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+}
+
+.search-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  background: var(--surface);
+}
+
+.selector__list {
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+
+.patient-row {
+  display: block;
+  width: 100%;
+  padding: 8px 16px;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  font: inherit;
+}
+
+.patient-row:hover {
+  background: var(--surface-sunken);
+}
+
+.patient-row[aria-selected='true'] {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.patient-row__name {
+  font-weight: 550;
+  color: var(--ink);
+}
+
+.patient-row__detail {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.patient-row__id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selector__footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------- panels -- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+}
+
+.panel__head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.panel__note {
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel__body {
+  padding: 12px 14px;
+}
+
+.panel__body--flush {
+  padding: 0;
+}
+
+/* ---------------------------------------------------------- patient head -- */
+
+.patient-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.patient-head__name {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.patient-head__ref {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 28px;
+  padding: 12px 14px;
+}
+
+.fact {
+  min-width: 96px;
+}
+
+.fact__label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.fact__value {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------- metrics -- */
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.metric {
+  padding: 10px 14px;
+  background: var(--surface);
+}
+
+.metric--absent {
+  background: var(--gap-soft);
+}
+
+.metric__label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.metric__value {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+}
+
+.metric__meta {
+  font-size: 11px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.metric__parts {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+/* ---------------------------------------------------------------- tables -- */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 7px 14px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  background: var(--surface-sunken);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.table tbody tr:hover {
+  background: var(--surface-sunken);
+}
+
+.table__date {
+  white-space: nowrap;
+  color: var(--ink-muted);
+}
+
+.table__value {
+  white-space: nowrap;
+  font-weight: 550;
+}
+
+.table__ref {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.table__name {
+  min-width: 220px;
+}
+
+/* ------------------------------------------------------------ small bits -- */
+
+.tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--surface-sunken);
+  border: 1px solid var(--line);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+.tag--type {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-ink);
+  font-weight: 550;
+}
+
+.tag--gap {
+  background: var(--gap-soft);
+  border-color: var(--gap-line);
+  color: var(--gap-ink);
+}
+
+.tag--alert {
+  background: var(--alert-soft);
+  border-color: transparent;
+  color: var(--alert-ink);
+}
+
+/*
+ * The missing-data token. Amber, italic, and dotted-underlined so it reads as
+ * "deliberately stated absence" rather than a blank cell or a failed render.
+ */
+.missing {
+  font-style: italic;
+  color: var(--gap-ink);
+  border-bottom: 1px dotted var(--gap-line);
+  cursor: help;
+}
+
+/*
+ * Loading placeholders.
+ *
+ * Sized to the content they stand in for so the main column keeps its height
+ * and nothing jumps when the real data lands. The shimmer is slow and low
+ * contrast on purpose — a busy pulse next to clinical values reads as an alert.
+ */
+.skeleton {
+  display: block;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--line) 25%, var(--surface-sunken) 50%, var(--line) 75%);
+  background-size: 240% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+.skeleton--title {
+  width: 260px;
+  height: 22px;
+}
+
+.skeleton--label {
+  width: 84px;
+  height: 10px;
+  margin: 3px 0;
+}
+
+.skeleton--value {
+  width: 64px;
+  height: 15px;
+}
+
+.skeleton--metric {
+  width: 108px;
+  height: 22px;
+  margin: 4px 0;
+}
+
+.skeleton--row {
+  width: 100%;
+  height: 13px;
+  margin-bottom: 10px;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 140% 0;
+  }
+  to {
+    background-position: -40% 0;
+  }
+}
+
+/* Respect a reduced-motion preference: hold the placeholder still instead. */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    background: var(--line);
+  }
+}
+
+/*
+ * The clicked row, while its record loads. Acknowledges the click on the same
+ * frame, so the selector never feels unresponsive during the request.
+ */
+.patient-row[aria-selected='true'] .patient-row__name::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+}
+
+.button {
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.button--on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 550;
+}
+
+.banner {
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  margin-bottom: 16px;
+}
+
+.banner--error {
+  background: var(--alert-soft);
+  border-color: transparent;
+  color: var(--alert-ink);
+}
+
+.banner--gap {
+  background: var(--gap-soft);
+  border-color: var(--gap-line);
+  color: var(--gap-ink);
+}
+
+.empty {
+  padding: 18px 14px;
+  color: var(--ink-muted);
+  text-align: center;
+}
+
+.stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.scroll-x {
+  overflow-x: auto;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

@@ -20,8 +20,10 @@ import { readChunk } from '../ingest/reader.js';
 import type { Chunk } from '../ingest/discover.js';
 import { normalizeResource } from '../normalize/index.js';
 import { DEFAULT_NORMALIZE_OPTIONS } from '../normalize/index.js';
-import { createTables, openDatabase } from '../store/db.js';
+import { closeDatabase, createTables, openDatabase } from '../store/db.js';
 import { StoreWriter } from '../store/writer.js';
+import { INSERT_RESOURCE, resourceParams } from '../store/statements.js';
+import type { NormalizedPatient, NormalizedResource } from '../model/types.js';
 import { emptyStats } from '../ingest/stats.js';
 import { processChunk } from '../ingest/process.js';
 
@@ -33,6 +35,20 @@ export interface StageTiming {
   shareOfTotal: number;
 }
 
+/** Second-level breakdown of the `store` stage, from `profile --deep`. */
+export interface StoreDetail {
+  resources: number;
+  jsonBytes: number;
+  avgJsonBytes: number;
+  rows: { resources: number; resourceCodings: number; components: number; distinctCodings: number };
+  stringifyMs: number;
+  resourceOnlyMs: number;
+  noBlobMs: number;
+  fullMs: number;
+  blobMs: number;
+  sideTableMs: number;
+}
+
 export interface ProfileResult {
   sampledBytes: number;
   sampledLines: number;
@@ -41,6 +57,8 @@ export interface ProfileResult {
   /** Extrapolated single-threaded cost for the whole dataset. */
   projectedFullRunSeconds: number;
   totalSourceBytes: number;
+  /** Present only when `deep` was requested. */
+  storeDetail?: StoreDetail;
 }
 
 const now = () => performance.now();
@@ -85,6 +103,7 @@ function sampleChunks(chunks: Chunk[], targetBytes: number): Chunk[] {
 export async function profileIngest(
   sourceDir: string,
   targetSampleBytes = 250 * 1024 * 1024,
+  deep = false,
 ): Promise<ProfileResult> {
   const files = await discoverBulkFiles(sourceDir);
   const totalSourceBytes = files.reduce((total, file) => total + file.sizeBytes, 0);
@@ -180,5 +199,104 @@ export async function profileIngest(
     stages,
     projectedFullRunSeconds: (total / 1000) * (totalSourceBytes / sampledBytes),
     totalSourceBytes,
+    ...(deep ? { storeDetail: await profileStore(sample) } : {}),
+  };
+}
+
+/**
+ * Breaks the `store` stage into its parts.
+ *
+ * The stage profile shows `store` dominating the load, but "store" bundles three
+ * different costs: serializing each record to JSON, writing the wide `resource`
+ * row (whose largest column is that JSON blob), and writing the side tables.
+ * The sample is normalized once, then written four ways so the differences
+ * between them attribute the cost.
+ */
+async function profileStore(sample: Chunk[]): Promise<StoreDetail> {
+  const resources: NormalizedResource[] = [];
+  const patients: NormalizedPatient[] = [];
+  for (const chunk of sample) {
+    await readChunk(chunk, (buffer, start, end) => {
+      try {
+        const raw: unknown = JSON.parse(buffer.toString('utf8', start, end));
+        const result = normalizeResource(raw, chunk.resourceType, DEFAULT_NORMALIZE_OPTIONS);
+        if (result.kind === 'resource') resources.push(result.resource);
+        else if (result.kind === 'patient') patients.push(result.patient);
+      } catch {
+        /* counted properly during real ingest */
+      }
+    });
+  }
+
+  // 1. Serialization alone.
+  let start = now();
+  let jsonBytes = 0;
+  for (const resource of resources) jsonBytes += JSON.stringify(resource).length;
+  const stringifyMs = now() - start;
+
+  const scratch = (suffix: string) => join(tmpdir(), `fhir-store-${suffix}-${process.pid}.db`);
+  const paths: string[] = [];
+  const fresh = (suffix: string) => {
+    const path = scratch(suffix);
+    paths.push(path);
+    const db = openDatabase(path, { fresh: true });
+    createTables(db);
+    return db;
+  };
+
+  // 2. The production writer: stringify + every table.
+  const fullDb = fresh('full');
+  const writer = new StoreWriter(fullDb, 25_000);
+  start = now();
+  for (const resource of resources) writer.addResource(resource);
+  for (const patient of patients) writer.addPatient(patient);
+  writer.flush();
+  const fullMs = now() - start;
+  const writerStats = { ...writer.stats };
+  closeDatabase(fullDb);
+
+  // 3. `resource` rows only, JSON pre-serialized — isolates side-table cost.
+  const payloads = resources.map((resource) => JSON.stringify(resource));
+  const mainDb = fresh('main');
+  const insertMain = mainDb.prepare(INSERT_RESOURCE);
+  start = now();
+  mainDb.exec('BEGIN IMMEDIATE');
+  resources.forEach((resource, index) => {
+    insertMain.run(...resourceParams(resource, payloads[index] ?? '{}'));
+  });
+  mainDb.exec('COMMIT');
+  const resourceOnlyMs = now() - start;
+  closeDatabase(mainDb);
+
+  // 4. Identical, but a 2-byte payload — isolates the blob's own write cost.
+  const slimDb = fresh('slim');
+  const insertSlim = slimDb.prepare(INSERT_RESOURCE);
+  start = now();
+  slimDb.exec('BEGIN IMMEDIATE');
+  for (const resource of resources) insertSlim.run(...resourceParams(resource, '{}'));
+  slimDb.exec('COMMIT');
+  const noBlobMs = now() - start;
+  closeDatabase(slimDb);
+
+  for (const path of paths) {
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${path}${suffix}`, { force: true });
+  }
+
+  return {
+    resources: resources.length,
+    jsonBytes,
+    avgJsonBytes: jsonBytes / Math.max(1, resources.length),
+    rows: {
+      resources: writerStats.resources,
+      resourceCodings: writerStats.resourceCodings,
+      components: writerStats.components,
+      distinctCodings: writerStats.codingsInterned,
+    },
+    stringifyMs,
+    resourceOnlyMs,
+    noBlobMs,
+    fullMs,
+    blobMs: resourceOnlyMs - noBlobMs,
+    sideTableMs: fullMs - resourceOnlyMs - stringifyMs,
   };
 }

@@ -24,6 +24,7 @@ export interface WorkerInit {
   maxNoteChars: number;
   allowedTypes?: string[];
   highWaterMark?: number;
+  legacyCodings?: boolean;
 }
 
 /** Main thread → worker. */
@@ -42,7 +43,7 @@ const port = parentPort;
 const init = workerData as WorkerInit;
 
 const db = openDatabase(init.dbPath);
-const writer = new StoreWriter(db, init.batchSize);
+const writer = new StoreWriter(db, init.batchSize, init.legacyCodings ?? false);
 const stats = emptyStats();
 
 const options: ProcessOptions = {

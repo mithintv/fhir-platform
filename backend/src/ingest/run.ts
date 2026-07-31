@@ -11,7 +11,6 @@
  */
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
-import { statSync } from 'node:fs';
 import { cpus } from 'node:os';
 import { discoverBulkFiles, planChunks } from './discover.js';
 import type { BulkFile, Chunk } from './discover.js';
@@ -20,7 +19,14 @@ import type { ProcessOptions } from './process.js';
 import { emptyStats, mergeStats } from './stats.js';
 import type { IngestStats } from './stats.js';
 import type { WorkerInit, WorkerRequest, WorkerResponse } from './worker.js';
-import { createIndexes, createTables, openDatabase, recordMeta } from '../store/db.js';
+import {
+  closeDatabase,
+  createIndexes,
+  createTables,
+  databaseSizeBytes,
+  openDatabase,
+  recordMeta,
+} from '../store/db.js';
 import { countSourceLines, verifyStore } from './verify.js';
 import type { VerificationReport } from './verify.js';
 import { StoreWriter } from '../store/writer.js';
@@ -45,6 +51,8 @@ export interface IngestOptions {
    * it cannot pollute the timings being compared.
    */
   verify: boolean;
+  /** Use the pre-optimization flat coding table. `bench` only. */
+  legacyCodings?: boolean;
   highWaterMark?: number;
   onProgress?: (completed: number, total: number) => void;
 }
@@ -99,7 +107,7 @@ export async function runIngest(options: IngestOptions): Promise<IngestResult> {
 
   // The main connection owns schema creation so workers never race on DDL.
   const db = openDatabase(options.dbPath, { fresh: true });
-  createTables(db);
+  createTables(db, options.legacyCodings ?? false);
 
   const loadStart = now();
   const stats =
@@ -109,7 +117,7 @@ export async function runIngest(options: IngestOptions): Promise<IngestResult> {
   const loadMs = now() - loadStart;
 
   const indexStart = now();
-  if (options.buildIndexes) createIndexes(db);
+  if (options.buildIndexes) createIndexes(db, options.legacyCodings ?? false);
   const indexMs = now() - indexStart;
 
   // Verification re-reads the source independently of the chunk planner and the
@@ -130,12 +138,19 @@ export async function runIngest(options: IngestOptions): Promise<IngestResult> {
   };
 
   recordMeta(db, 'source_dir', options.sourceDir);
+  // Stamped so the UI can state which ingest it is showing. A store written
+  // before this key existed simply reports the date as unknown.
+  recordMeta(db, 'ingested_at', new Date().toISOString());
   recordMeta(db, 'stats', stats);
   recordMeta(db, 'timings', timings);
   recordMeta(db, 'workers', options.workers);
+  recordMeta(db, 'legacy_codings', options.legacyCodings ?? false);
   if (verification) recordMeta(db, 'verification', verification);
   recordMeta(db, 'files', files.map((file) => ({ name: file.fileName, bytes: file.sizeBytes })));
-  db.close();
+
+  // Fold the WAL back in before closing: it can reach ~2 GB after a bulk load,
+  // and leaving it means later read-only connections see a pre-WAL snapshot.
+  closeDatabase(db);
 
   return {
     stats,
@@ -143,21 +158,13 @@ export async function runIngest(options: IngestOptions): Promise<IngestResult> {
     files,
     chunkCount: chunks.length,
     sourceBytes,
-    dbBytes: safeSize(options.dbPath),
+    dbBytes: databaseSizeBytes(options.dbPath),
     workers: options.workers,
     ...(verification ? { verification } : {}),
   };
 }
 
 /** File size for reporting; 0 when the file cannot be stat'd. */
-function safeSize(path: string): number {
-  try {
-    return statSync(path).size;
-  } catch {
-    return 0;
-  }
-}
-
 /** Projects run-level options down to what a single chunk needs. */
 function processOptions(options: IngestOptions): ProcessOptions {
   return {
@@ -174,7 +181,7 @@ function processOptions(options: IngestOptions): ProcessOptions {
 /** In-process load over every chunk in order — the benchmark's baseline. */
 async function runSingleThreaded(options: IngestOptions, chunks: Chunk[]): Promise<IngestStats> {
   const db = openDatabase(options.dbPath);
-  const writer = new StoreWriter(db, options.batchSize);
+  const writer = new StoreWriter(db, options.batchSize, options.legacyCodings ?? false);
   const stats = emptyStats();
   const shared = processOptions(options);
 
@@ -185,7 +192,7 @@ async function runSingleThreaded(options: IngestOptions, chunks: Chunk[]): Promi
   }
 
   writer.flush();
-  db.close();
+  closeDatabase(db);
   stats.filesRead = new Set(chunks.map((chunk) => chunk.path)).size;
   return stats;
 }
@@ -212,27 +219,44 @@ async function runParallel(options: IngestOptions, chunks: Chunk[]): Promise<Ing
   const workerCount = Math.min(options.workers, chunks.length);
   const merged = emptyStats();
 
-  let nextChunk = 0;
-  let completed = 0;
+  /** Chunks not yet handed to a worker. Pulled from the front. */
+  const pending = [...chunks];
+  /** Chunk each worker currently holds, so a death can put it back. */
+  const inFlight = new Map<Worker, Chunk>();
+  const done = new Set<number>();
   let liveWorkers = workerCount;
+  let aborted = false;
   const failures: string[] = [];
 
   await new Promise<void>((resolve, reject) => {
-    const workers: Worker[] = [];
-
     const dispatch = (worker: Worker): void => {
-      if (nextChunk >= chunks.length) {
+      if (aborted || pending.length === 0) {
+        inFlight.delete(worker);
         worker.postMessage({ type: 'finish' } satisfies WorkerRequest);
         return;
       }
-      const chunk = chunks[nextChunk++];
-      if (!chunk) return;
+      const chunk = pending.shift()!;
+      inFlight.set(worker, chunk);
       worker.postMessage({ type: 'chunk', chunk } satisfies WorkerRequest);
     };
 
     const finish = (): void => {
-      if (failures.length > 0) reject(new Error(failures.join('; ')));
-      else resolve();
+      if (failures.length > 0) {
+        reject(new Error(failures.join('; ')));
+        return;
+      }
+      // A worker that dies without reporting an error would otherwise leave its
+      // chunk unprocessed and the run looking successful.
+      if (done.size !== chunks.length) {
+        reject(
+          new Error(
+            `only ${done.size} of ${chunks.length} chunks completed — ` +
+              `${chunks.length - done.size} were lost with a worker`,
+          ),
+        );
+        return;
+      }
+      resolve();
     };
 
     for (let id = 0; id < workerCount; id += 1) {
@@ -244,13 +268,13 @@ async function runParallel(options: IngestOptions, chunks: Chunk[]): Promise<Ing
         maxNoteChars: options.maxNoteChars,
         allowedTypes: options.types,
         highWaterMark: options.highWaterMark,
+        legacyCodings: options.legacyCodings ?? false,
       };
 
       const worker = new Worker(entry.url, {
         workerData: init,
         ...(entry.execArgv ? { execArgv: entry.execArgv } : {}),
       });
-      workers.push(worker);
 
       worker.on('message', (message: WorkerResponse) => {
         switch (message.type) {
@@ -258,25 +282,40 @@ async function runParallel(options: IngestOptions, chunks: Chunk[]): Promise<Ing
             dispatch(worker);
             break;
           case 'chunk-done':
-            options.onProgress?.(++completed, chunks.length);
+            done.add(message.chunkId);
+            inFlight.delete(worker);
+            options.onProgress?.(done.size, chunks.length);
             dispatch(worker);
             break;
           case 'finished':
             mergeStats(merged, message.stats);
+            inFlight.delete(worker);
             void worker.terminate();
             break;
           case 'failed':
+            // Stop handing out work: the run is going to fail, and the other
+            // workers would otherwise process the whole export first.
+            aborted = true;
             failures.push(message.message);
+            inFlight.delete(worker);
             void worker.terminate();
             break;
         }
       });
 
       worker.on('error', (error) => {
+        aborted = true;
         failures.push(error.message);
       });
 
       worker.on('exit', () => {
+        // A worker holding a chunk when it exits died mid-work. Put the chunk
+        // back so a surviving worker can take it, rather than losing it.
+        const orphaned = inFlight.get(worker);
+        if (orphaned) {
+          inFlight.delete(worker);
+          pending.unshift(orphaned);
+        }
         liveWorkers -= 1;
         if (liveWorkers === 0) finish();
       });

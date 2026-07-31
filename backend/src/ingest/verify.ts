@@ -115,11 +115,14 @@ export function verifyStore(
     .filter(([type]) => type !== 'Patient')
     .reduce((total, [, value]) => total + value, 0);
 
+  // Counted once and reused: each of these is a full scan of 1.4M rows.
+  const resourceRows = count('SELECT count(*) AS n FROM resource');
+
   checks.push({
     name: 'resource rows committed vs. normalized',
     expected: normalizedResources,
-    actual: count('SELECT count(*) AS n FROM resource'),
-    ok: count('SELECT count(*) AS n FROM resource') === normalizedResources,
+    actual: resourceRows,
+    ok: resourceRows === normalizedResources,
     detail: 'catches records counted but never written',
   });
 
@@ -145,9 +148,9 @@ export function verifyStore(
   );
   checks.push({
     name: 'resource ids unique per type',
-    expected: count('SELECT count(*) AS n FROM resource'),
+    expected: resourceRows,
     actual: distinctResources,
-    ok: distinctResources === count('SELECT count(*) AS n FROM resource'),
+    ok: distinctResources === resourceRows,
     detail: 'duplicate ids would break AI-citation grounding in Part D',
   });
 

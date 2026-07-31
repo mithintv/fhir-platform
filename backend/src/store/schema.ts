@@ -121,6 +121,37 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
 `;
 
 /**
+ * The pre-optimization coding table, kept so `bench` can measure the change
+ * rather than assert it. One row per coding, repeating the system URL and
+ * display string on every row.
+ */
+export const CREATE_TABLES_LEGACY_CODING = `
+CREATE TABLE IF NOT EXISTS resource_coding_flat (
+  resource_id   TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  patient_id    TEXT,
+  system        TEXT,
+  code          TEXT,
+  display       TEXT
+);
+`;
+
+export const CREATE_INDEXES_LEGACY_CODING = `
+CREATE INDEX IF NOT EXISTS resource_coding_flat_lookup
+  ON resource_coding_flat (system, code);
+CREATE INDEX IF NOT EXISTS resource_coding_flat_patient
+  ON resource_coding_flat (patient_id, code);
+`;
+
+/** Index set for the current dictionary + association coding model. */
+export const CREATE_INDEXES_CODING = `
+CREATE INDEX IF NOT EXISTS resource_coding_by_coding
+  ON resource_coding (coding_id, resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS resource_coding_by_resource
+  ON resource_coding (resource_type, resource_id, ordinal);
+`;
+
+/**
  * Created after the bulk load.
  *
  * The index set is driven by the queries the later parts actually run:
@@ -141,10 +172,6 @@ CREATE INDEX IF NOT EXISTS resource_patient_time
   ON resource (patient_id, effective_sort);
 CREATE INDEX IF NOT EXISTS resource_patient_type_time
   ON resource (patient_id, resource_type, effective_sort);
-CREATE INDEX IF NOT EXISTS resource_coding_by_coding
-  ON resource_coding (coding_id, resource_type, resource_id);
-CREATE INDEX IF NOT EXISTS resource_coding_by_resource
-  ON resource_coding (resource_type, resource_id, ordinal);
 CREATE INDEX IF NOT EXISTS observation_component_coding
   ON observation_component (coding_id, patient_id);
 CREATE INDEX IF NOT EXISTS patient_name

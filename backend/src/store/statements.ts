@@ -24,6 +24,11 @@ INSERT INTO resource
    effective_value, effective_sort, value_num, value_unit, value_text, issues, json)
 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`;
 
+/** Pre-optimization write path, used only by `bench` to measure the change. */
+export const INSERT_LEGACY_CODING = `
+INSERT INTO resource_coding_flat (resource_id, resource_type, patient_id, system, code, display)
+VALUES (?,?,?,?,?,?)`;
+
 export const INSERT_RESOURCE_CODING = `
 INSERT INTO resource_coding (resource_type, resource_id, coding_id, ordinal) VALUES (?,?,?,?)`;
 

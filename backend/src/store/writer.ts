@@ -17,6 +17,7 @@ import type { Db } from './db.js';
 import {
   INSERT_CODING,
   INSERT_COMPONENT,
+  INSERT_LEGACY_CODING,
   INSERT_PATIENT,
   INSERT_RESOURCE,
   INSERT_RESOURCE_CODING,
@@ -48,6 +49,7 @@ export class StoreWriter {
   private readonly insertPatient;
   private readonly insertResource;
   private readonly insertResourceCoding;
+  private readonly insertLegacyCoding;
   private readonly insertCoding;
   private readonly selectCoding;
   private readonly insertComponent;
@@ -76,10 +78,13 @@ export class StoreWriter {
     private readonly db: Db,
     /** Rows buffered before a transaction is committed. */
     private readonly batchSize = 25_000,
+    /** Write the pre-optimization flat coding table instead. `bench` only. */
+    private readonly legacyCodings = false,
   ) {
     this.insertPatient = db.prepare(INSERT_PATIENT);
     this.insertResource = db.prepare(INSERT_RESOURCE);
     this.insertResourceCoding = db.prepare(INSERT_RESOURCE_CODING);
+    this.insertLegacyCoding = legacyCodings ? db.prepare(INSERT_LEGACY_CODING) : undefined;
     this.insertCoding = db.prepare(INSERT_CODING);
     this.selectCoding = db.prepare(SELECT_CODING);
     this.insertComponent = db.prepare(INSERT_COMPONENT);
@@ -173,11 +178,25 @@ export class StoreWriter {
     // both "History and physical note" and "Evaluation + Plan note", say) — so
     // a single code column on the resource cannot represent it.
     const codings = resource.code?.codings ?? [];
-    for (let ordinal = 0; ordinal < codings.length; ordinal += 1) {
-      const id = this.codingId(codings[ordinal]!);
-      if (id === undefined) continue;
-      this.insertResourceCoding.run(resource.resourceType, resource.id, id, ordinal);
-      this.stats.resourceCodings += 1;
+    if (this.insertLegacyCoding) {
+      for (const coding of codings) {
+        this.insertLegacyCoding.run(
+          resource.id,
+          resource.resourceType,
+          bind(resource.patientId),
+          bind(coding.system),
+          bind(coding.code),
+          bind(coding.display),
+        );
+        this.stats.resourceCodings += 1;
+      }
+    } else {
+      for (let ordinal = 0; ordinal < codings.length; ordinal += 1) {
+        const id = this.codingId(codings[ordinal]!);
+        if (id === undefined) continue;
+        this.insertResourceCoding.run(resource.resourceType, resource.id, id, ordinal);
+        this.stats.resourceCodings += 1;
+      }
     }
 
     if (resource.resourceType !== 'Observation') return;

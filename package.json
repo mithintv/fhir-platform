@@ -1,0 +1,15 @@
+{
+  "name": "autonomy-health",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FHIR prior-authorization review tool",
+  "scripts": {
+    "ingest": "pnpm --filter @autonomy/backend exec tsx src/cli.ts ingest",
+    "api": "pnpm --filter @autonomy/backend exec tsx src/cli.ts serve",
+    "ui": "pnpm --filter @autonomy/frontend dev",
+    "dev": "pnpm --parallel --filter \"@autonomy/*\" dev",
+    "build": "pnpm --filter @autonomy/frontend build",
+    "typecheck": "pnpm --recursive run typecheck",
+    "test": "pnpm --recursive run test"
+  }
+}
